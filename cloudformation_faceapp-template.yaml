@@ -1,0 +1,268 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Facial Recognition App - Full Infrastructure
+
+Resources:
+
+# =========================
+# S3 BUCKETS
+# =========================
+
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: samuel-faceapp-frontend
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: PublicRead
+            Effect: Allow
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub "${FrontendBucket.Arn}/*"
+
+  EmployeeImagesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: samuel-employee-images
+
+  VisitorImagesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: samuel-visitor-images
+
+# =========================
+# CLOUD FRONT (ADDED)
+# =========================
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+
+        Origins:
+          - Id: FrontendOrigin
+            DomainName: !Sub "${FrontendBucket}.s3-website-${AWS::Region}.amazonaws.com"
+            CustomOriginConfig:
+              OriginProtocolPolicy: http-only
+
+        DefaultCacheBehavior:
+          TargetOriginId: FrontendOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+
+        PriceClass: PriceClass_100
+
+# =========================
+# DYNAMODB
+# =========================
+
+  EmployeeTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: employee
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: rekognitionid
+          AttributeType: S
+      KeySchema:
+        - AttributeName: rekognitionid
+          KeyType: HASH
+
+# =========================
+# REKOGNITION
+# =========================
+
+  RekognitionCollection:
+    Type: AWS::Rekognition::Collection
+    Properties:
+      CollectionId: employees
+
+# =========================
+# IAM ROLE
+# =========================
+
+  FacialRecognitionLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: FacialRecognitionLamdaRole-sam
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FacialRecognitionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub "arn:aws:s3:::samuel-employee-images/*"
+                  - !Sub "arn:aws:s3:::samuel-visitor-images/*"
+
+              - Effect: Allow
+                Action:
+                  - rekognition:IndexFaces
+                  - rekognition:SearchFacesByImage
+                  - rekognition:DetectFaces
+                  - rekognition:CreateCollection
+                  - rekognition:DescribeCollection
+                  - rekognition:ListCollections
+                Resource: "*"
+
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:Scan
+                  - dynamodb:Query
+                Resource: !GetAtt EmployeeTable.Arn
+
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+# =========================
+# LAMBDA FUNCTIONS
+# =========================
+
+  EmployeeAuthenticationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: employee-authentication
+      Runtime: python3.14
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt FacialRecognitionLambdaRole.Arn
+      Timeout: 60
+      MemorySize: 500
+
+  EmployeeRegistrationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: employee-registration
+      Runtime: python3.14
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt FacialRecognitionLambdaRole.Arn
+      Timeout: 60
+      MemorySize: 500
+
+# =========================
+# API GATEWAY
+# =========================
+
+  FaceAppApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: FaceAppAPI
+
+  UploadResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref FaceAppApi
+      ParentId: !GetAtt FaceAppApi.RootResourceId
+      PathPart: upload
+
+  BucketResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref FaceAppApi
+      ParentId: !GetAtt FaceAppApi.RootResourceId
+      PathPart: bucket
+
+# =========================
+# METHODS
+# =========================
+
+  UploadPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref FaceAppApi
+      ResourceId: !Ref UploadResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub >
+          arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${EmployeeAuthenticationFunction.Arn}/invocations
+
+  BucketPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref FaceAppApi
+      ResourceId: !Ref BucketResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub >
+          arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${EmployeeAuthenticationFunction.Arn}/invocations
+
+# =========================
+# PERMISSIONS
+# =========================
+
+  LambdaInvokePermissionUpload:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EmployeeAuthenticationFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+
+  LambdaInvokePermissionBucket:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EmployeeAuthenticationFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+
+# =========================
+# DEPLOYMENT
+# =========================
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - UploadPostMethod
+      - BucketPostMethod
+    Properties:
+      RestApiId: !Ref FaceAppApi
+      StageName: dev
